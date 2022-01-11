@@ -1,0 +1,707 @@
+---
+title: "COVID Vaccination Rates"
+author: "Jessica Linford, Luis Quilarque, Odessa Reyno"
+output: html_document
+---
+
+```{r setup, echo = FALSE}
+library(usdata) #convert state abbreviations to state names
+library(RcmdrMisc) #forward and backward stepwise selection
+library(glmnet) #fit elastic net, Poisson, and negative binomial models
+library(corrplot) #draw correlation plots
+library(e1071) #skewness
+library(caret) #preprocessing, data splitting, model training 
+library(tidyverse)
+library(xgboost) #boosting
+library(gbm) #boosting
+library(doParallel) #parallel processing
+```
+
+``` {r ggplot-missing-function, echo = FALSE}
+#This function creates a graph to identify observations with missing data
+ggplot_missing <- function(x){
+  if(!require(reshape2)){warning('you need to install reshape2')}
+  require(reshape2)
+  require(ggplot2)
+  x %>% 
+    is.na %>%
+    melt %>%
+    ggplot(data = .,
+           aes(x = Var2,
+               y = Var1)) +
+    geom_raster(aes(fill = value)) +
+    scale_fill_grey(name = "",
+                    labels = c("Present","Missing")) +
+    theme_minimal() + 
+    theme(axis.text.x  = element_text(angle=45, vjust=0.5)) + 
+    labs(x = "Variables in Dataset",
+         y = "Rows / observations")
+}
+```
+
+### Presidential Election Data 2020 from New York Times
+Compiled by Tony McGovern
+https://github.com/tonmcg/US_County_Level_Election_Results_08-20
+### Race Age, Income, and Education Data from the US Census Bureau
+https://data.census.gov/cedsci/
+``` {r features}
+load('COVIDdata.Rda')
+
+presVote <- presVote %>%
+  unite(county, c(county_name, state_name), sep = ", ", remove = F) %>% 
+  select(county, state_name, per_dem) %>% 
+  rename(state = state_name)
+
+race[,3:72] <- race[,3:72] * 100 / race$total
+race <- race[,-c(2,28:47,49:72)]
+race <- as_tibble(race)
+
+features <- full_join(age, education, by = "county") %>% 
+  full_join(income, by = "county") %>% 
+  left_join(race, by = "county") %>% 
+  left_join(presVote, by = "county")
+features
+
+rm(presVote, race, age, education, income)
+```
+
+### Vaccination Data from CDC and State Health Departments
+https://data.cdc.gov/Vaccinations/COVID-19-Vaccinations-in-the-United-States-County/8xkx-amqh
+https://dshs.texas.gov/coronavirus/AdditionalData.aspx
+https://health.hawaii.gov/coronavirusdisease2019/current-situation-in-hawaii/
+https://experience.arcgis.com/experience/3d8eea39f5c1443db1743a4cb8948a9c
+https://dhhr.wv.gov/COVID-19/Pages/default.aspx
+https://covid19.alabama.gov/vaccine
+https://www.mass.gov/doc/weekly-covid-19-vaccination-report-november-11-2021/download
+https://cvvaccine.nmhealth.org/public-dashboard.html
+https://public.tableau.com/app/profile/idaho.division.of.public.health/viz/COVID-19VaccineDataDashboard/LandingPage
+https://ladhh.maps.arcgis.com/apps/webappviewer/index.html?id=3b9b6f22d92f4d688f1c21e9d154cae2
+https://dph.illinois.gov/covid19/vaccine/vaccine-data?county=Illinois
+https://www.vdh.virginia.gov/coronavirus/see-the-numbers/covid-19-in-virginia/covid-19-vaccine-summary/
+``` {r vaccination-data}
+state_vac_data <- state_vac_data %>% 
+  unite(county, c(county, state), sep = ", ", remove = T) %>% 
+  select(county, vac_rate, total_vac)
+  
+cdc <- cdc %>%
+  filter(vac_rate > 1 & !state %in% c('AL', 'GA', 'HI', 'ID', 'IL', 'LA', 'MA', 
+                                      'NM', 'TX', 'VA', 'WV')) %>%
+  mutate(state = abbr2state(state)) %>%
+  arrange(state, county) %>%
+  unite(county, c(county, state), sep = ", ", remove = T)
+
+vaccine <- cdc %>%
+  bind_rows(state_vac_data)
+vaccine
+
+fullDataSet <- left_join(features, vaccine, by = "county")
+
+rm(state_vac_data, cdc)
+```
+
+### Join Supervisor to Features and Check for Missing Values
+```{r identify-missing-data}
+ggplot_missing(fullDataSet)
+
+# Find counties with missing voting data
+fullDataSet %>% 
+  filter(is.na(per_dem)) %>% 
+  select(county) %>% print(n = Inf)
+
+# Find counties with missing vaccine data
+fullDataSet %>% 
+  filter(is.na(vac_rate)) %>% 
+  select(county) %>% print(n = Inf)
+```
+
+### Drop Missing Values
+No clear way to impute Alaska election results. Alaska voter maps at 
+https://www.elections.alaska.gov/doc/maps/area/2013-Proclamation-Anchorage.pdf
+https://www.elections.alaska.gov/doc/maps/area/2013-Proclamation-Fairbanks.pdf
+https://www.elections.alaska.gov/doc/maps/area/2013-Proclamation-MatSu.pdf
+``` {r clean-missing-data}
+cleanData <- fullDataSet %>% drop_na()
+rm(fullDataSet)
+```
+
+### Examine Distribution of Supervisor, Check Unusual Values
+```{r examine-vaccine-distribution}
+hist(cleanData$vac_rate)
+
+cleanData %>% 
+  select(county,vac_rate) %>% 
+  filter(vac_rate <30 | vac_rate >80) %>% 
+  print(n=Inf)
+Y <- cleanData %>% select(vac_rate) %>% unlist()
+```
+
+### Preprocessing
+``` {r skewness-correction}
+X <- cleanData %>% select(-c(county, state, vac_rate, total_vac))
+
+skewnessCriterion <- abs(sapply(X, skewness)) > 2
+
+X %>% select_if(skewnessCriterion) %>% apply(2, skewness)
+
+XskewedYJ <- X %>%
+  select_if(skewnessCriterion) %>%
+  preProcess(method = 'YeoJohnson') %>%
+  predict(X %>% select_if(skewnessCriterion))
+
+XnotSkewed <- X %>%
+  select_if(!skewnessCriterion)
+
+Xyj <- cbind(XskewedYJ, XnotSkewed)
+
+Xpp <- Xyj %>% preProcess(.) %>% predict(newdata = Xyj)
+
+rm(cleanData, XskewedYJ, XnotSkewed, skewnessCriterion, Xyj)
+```
+
+### Group Features by Topic and Make Correlation Plots
+``` {r correlation-plots}
+xPopulation <- X[,c(1:24, 50)]
+xIncome <- X[,c(25:30, 51:62)]
+xEducation <- X[,31:49]
+xEducInc <- X[,c(25:49, 51:62)]
+xRace <- X[,63:88]
+
+corrplot(cor(xPopulation), order = "hclust", tl.cex = 0.7)
+corrplot(cor(xIncome), order = "hclust", tl.cex = 0.7)
+corrplot(cor(xEducation), order = "hclust", tl.cex = 0.7)
+corrplot(cor(xEducInc), order = "hclust", tl.cex = 0.7)
+corrplot(cor(xRace), order = "hclust", tl.cex = 0.7)
+
+rm(xPopulation, xIncome, xEducation, xEducInc, xRace)
+```
+
+### Remove Highly Correlated Features
+```{r highly-correlated-features}
+Xcorr = cor(X)
+
+(highCorr = findCorrelation(Xcorr, .85, verbose = TRUE, names = TRUE))
+
+XremCorr = select(X, -all_of(highCorr))
+XppRemCorr = select(Xpp, -all_of(highCorr))
+
+rm(Xcorr, highCorr)
+```
+
+### Hand-Selected Features
+``` {r hand-selected}
+Xselect <- X %>%
+  select(population, median_age, males_per_100_females, 
+         child_dependency_ratio, W, B, I, A, H, two_plus_races, 
+         pct_bach_or_higher_25_plus, pct_less_9th_25_plus,
+         median_household_income, per_dem)
+
+XppSelect <- Xpp %>% 
+  select(population, median_age, males_per_100_females,
+         child_dependency_ratio, W, B, I, A, H, two_plus_races, 
+         pct_bach_or_higher_25_plus, pct_less_9th_25_plus, 
+         median_household_income, per_dem)
+```
+
+### Training Testing Split
+``` {r training-testing-split}
+set.seed(1)
+trainIndex = createDataPartition(Y, p = .75, list = FALSE) %>% as.vector(.)
+testIndex  = (1:length(Y))[-trainIndex]
+
+role            = rep('train',length(Y))
+role[testIndex] = 'test'
+
+Ytrain <- Y[trainIndex] %>% as.vector()
+Ytest <- Y[testIndex] %>% as.vector()
+
+Xtrain <- X[trainIndex,]
+Xtest <- X[testIndex,]
+
+XppTrain <- Xpp[trainIndex,]
+XppTest <- Xpp[testIndex,]
+
+XselectTrain <- Xselect[trainIndex,]
+XselectTest <- Xselect[testIndex,]
+
+XppSelectTrain <- XppSelect[trainIndex,]
+XppSelectTest <- XppSelect[testIndex,]
+
+XremCorrTrain <- XremCorr[trainIndex,]
+XremCorrTest <- XremCorr[testIndex,]
+
+XppRemCorrTrain <- XppRemCorr[trainIndex,]
+XppRemCorrTest <- XppRemCorr[testIndex,]
+
+rm(role, trainIndex, testIndex)
+```
+
+# Models
+
+- Models in order of increasing test error:
+  - Best: Model 4
+  - Model 6
+  - Model 2
+  - Model 5
+  - Model 7
+  - Model 10
+  - Model 3
+  - Model 9
+  - Model 8
+  - Worst: Model 1
+  
+
+### Model 1: Maximum Interpretability - No Transformations
+### Multiple Linear Regression with Forward Backward Selection using AIC
+``` {r mlr-no-transformation}
+# model with all explanatory variables
+mlr.full <- lm(Ytrain ~ ., data = cbind.data.frame(XselectTrain, Ytrain))
+
+# Forward/backward AIC
+mlr.AIC <- stepwise(mlr.full,
+                    direction="forward/backward",criterion='AIC')
+
+summary(mlr.AIC)
+betaHatMLR = coef(mlr.AIC)
+
+YhatTrainMLR = predict(mlr.AIC, newdata = XselectTrain)
+residTrainMLR = rstudent(mlr.AIC)
+plot(YhatTrainMLR, residTrainMLR, xlab = 'Training Predictions', 
+     ylab = 'Residuals')
+
+YhatTestMLR = predict(mlr.AIC, newdata = XselectTest)
+
+(trainErrorMLR <- mean((YhatTrainMLR - Ytrain)**2))
+(testErrorMLR <- mean((YhatTestMLR - Ytest)**2))
+
+ImportMLR = 
+  abs(betaHatMLR[-1])/sum(abs(betaHatMLR[-1]))
+ImportMLR = data.frame(sort(ImportMLR, decreasing = TRUE))
+names(ImportMLR) = "Importance"
+ImportMLR
+ggplot(data = ImportMLR) + 
+  geom_col(aes(x = Importance, 
+               y = reorder(row.names(ImportMLR), Importance))) + 
+  labs(x = "Importance", y = "Feature")
+
+rm(residTrainMLR)
+```
+
+### Model 2: Elastic Net on Unfiltered, Preprocessed Data
+``` {r elastic-net-unfiltered-preprocessed, cache = TRUE}
+set.seed(1)
+
+trControl = trainControl(method = "repeatedcv", number = 10, repeats = 4)
+
+tuneGrid = expand.grid('alpha' = c(0, 0.25, 0.5, 0.75, 1),
+                       'lambda' = seq(0.001, 0.2, length.out = 30))
+
+elasticOut = train(x = XppTrain, y = Ytrain, 
+                   method = "glmnet", trControl = trControl,
+                   tuneGrid = tuneGrid)
+
+plot(elasticOut, xlab = "Penalty", ylab = "K-fold CV")
+
+elasticOut$bestTune
+alphaHat = elasticOut$bestTune$alpha
+lambdaHat = elasticOut$bestTune$lambda
+
+EnetOutPP = glmnet(x = XppTrain, y = Ytrain,
+                   alpha = alphaHat, standardize = FALSE)
+
+betaHatEnetPP = coef(EnetOutPP, s = lambdaHat)
+betaHatEnetPP = data.frame(Feature = betaHatEnetPP@Dimnames[[1]]
+                           [which(betaHatEnetPP != 0)], 
+                           Beta = betaHatEnetPP
+                           [which(betaHatEnetPP != 0)])
+
+YhatTrainEnetPP = predict(EnetOutPP, as.matrix(XppTrain), s = lambdaHat)
+
+residEnetPP = Ytrain - YhatTrainEnetPP
+
+plot(YhatTrainEnetPP, residEnetPP, 
+     xlab = 'Training Predictions', ylab = 'Residuals')
+
+YhatTestEnetPP = predict(EnetOutPP, as.matrix(XppTest), s = lambdaHat)
+
+(trainErrorEnetPP = mean((YhatTrainEnetPP - Ytrain)**2))
+(testErrorEnetPP = mean((YhatTestEnetPP - Ytest)**2))
+
+Importance = abs(betaHatEnetPP$Beta[-1])/sum(abs(betaHatEnetPP$Beta[-1]))
+ImportEnetPP <- data.frame(Feature = betaHatEnetPP$Feature[-1], Importance) %>% 
+  arrange(desc(Importance))
+head(ImportEnetPP)
+
+ggplot(data = ImportEnetPP[1:20,]) + 
+  geom_col(aes(x = Importance, 
+               y = reorder(Feature, Importance))) + 
+  labs(x = "Importance", y = "Feature")
+
+rm(elasticOut, alphaHat, lambdaHat, residEnetPP, Importance)
+```
+
+### Model 3: Elastic Net on Hand-Selected, Preprocessed Data
+``` {r elastic-net-selected-preprocessed, cache = TRUE}
+set.seed(1)
+
+trControl = trainControl(method = "repeatedcv", number = 10, repeats = 4)
+
+tuneGrid = expand.grid('alpha' = c(0, 0.25, 0.5, 0.75, 1),
+                       'lambda' = seq(0.001, 0.2, length.out = 30))
+
+elasticOut = train(x = XppSelectTrain, y = Ytrain, 
+                   method = "glmnet", trControl = trControl,
+                   tuneGrid = tuneGrid)
+
+plot(elasticOut, xlab = "Penalty", ylab = "K-fold CV")
+
+elasticOut$bestTune
+alphaHat = elasticOut$bestTune$alpha
+lambdaHat = elasticOut$bestTune$lambda
+
+EnetOutSelectPP = glmnet(x = XppSelectTrain, y = Ytrain,
+                          alpha = alphaHat, standardize = FALSE)
+
+betaHatEnetSelectPP = coef(EnetOutSelectPP, s = lambdaHat)
+betaHatEnetSelectPP = data.frame(Feature = betaHatEnetSelectPP@Dimnames[[1]]
+                                 [which(betaHatEnetSelectPP != 0)], 
+                                 Beta = betaHatEnetSelectPP
+                                 [which(betaHatEnetSelectPP != 0)])
+
+YhatTrainEnetSelectPP = predict(EnetOutSelectPP,
+                                as.matrix(XppSelectTrain), s = lambdaHat)
+
+residEnetSelectPP = Ytrain - YhatTrainEnetSelectPP
+
+plot(YhatTrainEnetSelectPP, residEnetSelectPP, 
+     xlab = 'Training Predictions', ylab = 'Residuals')
+
+YhatTestEnetSelectPP = predict(EnetOutSelectPP,
+                               as.matrix(XppSelectTest), s = lambdaHat)
+
+(trainErrorEnetSelectPP = mean((YhatTrainEnetSelectPP - Ytrain)**2))
+(testErrorEnetSelectPP = mean((YhatTestEnetSelectPP - Ytest)**2))
+
+Importance = 
+  abs(betaHatEnetSelectPP$Beta[-1])/sum(abs(betaHatEnetSelectPP$Beta[-1]))
+ImportEnetSelectPP <- data.frame(Feature = betaHatEnetSelectPP$Feature[-1],
+                                 Importance) %>% 
+  arrange(desc(Importance))
+ImportEnetSelectPP
+
+ggplot(data = ImportEnetSelectPP) + 
+  geom_col(aes(x = Importance, 
+               y = reorder(Feature, Importance))) + 
+  labs(x = "Importance", y = "Feature")
+
+rm(elasticOut, alphaHat, lambdaHat, residEnetSelectPP, Importance)
+```
+
+### Model 4: Elastic Net on Correlation-Filtered, Preprocessed Data
+``` {r elastic-net-correlation-filtered-preprocessed, cache = TRUE}
+set.seed(1)
+
+trControl = trainControl(method = "repeatedcv", number = 10, repeats = 4)
+
+tuneGrid = expand.grid('alpha' = c(0, 0.25, 0.5, 0.75, 1),
+                       'lambda' = seq(0.001, 0.2, length.out = 30))
+
+elasticOut = train(x = XppRemCorrTrain, y = Ytrain, 
+                   method = "glmnet", trControl = trControl,
+                   tuneGrid = tuneGrid)
+
+plot(elasticOut, xlab = "Penalty", ylab = "K-fold CV")
+
+elasticOut$bestTune
+alphaHat = elasticOut$bestTune$alpha
+lambdaHat = elasticOut$bestTune$lambda
+
+EnetOutRemCorrPP = glmnet(x = XppRemCorrTrain, y = Ytrain,
+                          alpha = alphaHat, standardize = FALSE)
+
+betaHatEnetRemCorrPP = coef(EnetOutRemCorrPP, s = lambdaHat)
+betaHatEnetRemCorrPP = data.frame(Feature = betaHatEnetRemCorrPP@Dimnames[[1]]
+                                 [which(betaHatEnetRemCorrPP != 0)], 
+                                 Beta = betaHatEnetRemCorrPP
+                                 [which(betaHatEnetRemCorrPP != 0)])
+
+YhatTrainEnetRemCorrPP = predict(EnetOutRemCorrPP,
+                                 as.matrix(XppRemCorrTrain), s = lambdaHat)
+
+residEnetRemCorrPP = Ytrain - YhatTrainEnetRemCorrPP
+
+plot(YhatTrainEnetRemCorrPP, residEnetRemCorrPP, 
+     xlab = 'Training Predictions', ylab = 'Residuals')
+
+YhatTestEnetRemCorrPP = predict(EnetOutRemCorrPP,
+                                as.matrix(XppRemCorrTest), s = lambdaHat)
+
+(trainErrorEnetRemCorrPP = mean((YhatTrainEnetRemCorrPP - Ytrain)**2))
+(testErrorEnetRemCorrPP = mean((YhatTestEnetRemCorrPP - Ytest)**2))
+
+Importance = 
+  abs(betaHatEnetRemCorrPP$Beta[-1])/sum(abs(betaHatEnetRemCorrPP$Beta[-1]))
+ImportEnetRemCorrPP <- data.frame(Feature = betaHatEnetRemCorrPP$Feature[-1],
+                                 Importance) %>% 
+  arrange(desc(Importance))
+head(ImportEnetRemCorrPP)
+
+ggplot(data = ImportEnetRemCorrPP[1:20,]) + 
+  geom_col(aes(x = Importance, 
+               y = reorder(Feature, Importance))) + 
+  labs(x = "Importance", y = "Feature")
+
+rm(elasticOut, alphaHat, lambdaHat, residEnetRemCorrPP)
+```
+### Set up Parallel Processing
+```{r parallel}
+cl = makeCluster(2)
+registerDoParallel(cl)
+```
+
+### Model 5: Boosting on unprocessed, unfiltered data
+```{r boost-raw, cache = TRUE, warning = FALSE}
+set.seed(1)
+
+trControl = trainControl(method = "repeatedcv", number = 10, repeats = 4)
+
+tuneGrid = data.frame('nrounds'=c(50, 150, 500, 1000, 2000, 3000),
+                      'max_depth' = c(2, 4),
+                      'eta' = .01,
+                      'gamma' = 0,
+                      'colsample_bytree' = 1,
+                      'min_child_weight' = 0,
+                      'subsample' = .5)
+
+boostOut   = train(x = Xtrain, y = Ytrain,
+                   method = "xgbTree", verbose = 0,
+                   tuneGrid = tuneGrid,
+                   trControl = trControl)
+
+plot(boostOut)
+boostOut$bestTune
+
+YhatTrainBoost   = predict(boostOut, Xtrain)
+YhatTestBoost   = predict(boostOut, Xtest)
+
+residuals = Ytrain - YhatTrainBoost
+plot(YhatTrainBoost, residuals,
+     xlab = 'Training Predictions', ylab = 'Residuals')
+
+(trErrBoost = mean((YhatTrainBoost - Ytrain)**2))
+(testErrBoost = mean((YhatTestBoost - Ytest)**2))
+
+boostImport = xgb.importance(model = boostOut$finalModel) 
+head(boostImport)
+ggplot(data = boostImport[1:20,]) + 
+  geom_col(aes(x = Gain, 
+               y = reorder(Feature, Gain))) + 
+  labs(x = "Importance", y = "Feature")
+
+rm(tuneGrid, residuals)
+```
+
+### Model 6: Boosting on preprocessed, unfiltered data
+```{r boost-preprocessed, cache = TRUE, warning = FALSE}
+set.seed(1)
+
+trControl = trainControl(method = "repeatedcv", number = 10, repeats = 4)
+
+tuneGrid = data.frame('nrounds'=c(50, 150, 500, 1000, 2000, 3000),
+                      'max_depth' = c(2, 4),
+                      'eta' = .01,
+                      'gamma' = 0,
+                      'colsample_bytree' = 1,
+                      'min_child_weight' = 0,
+                      'subsample' = .5)
+
+boostOutPP   = train(x = XppTrain, y = Ytrain,
+                   method = "xgbTree", verbose = 0,
+                   tuneGrid = tuneGrid,
+                   trControl = trControl)
+
+plot(boostOutPP)
+boostOutPP$bestTune
+
+YhatTrainBoostPP   = predict(boostOutPP, XppTrain)
+YhatTestBoostPP   = predict(boostOutPP, XppTest)
+
+residuals = Ytrain - YhatTrainBoostPP
+plot(YhatTrainBoostPP, residuals,
+     xlab = 'Training Predictions', ylab = 'Residuals')
+
+(trErrBoostPP = mean((YhatTrainBoostPP - Ytrain)**2))
+(testErrBoostPP = mean((YhatTestBoostPP - Ytest)**2))
+
+boostImportPP = xgb.importance(model = boostOutPP$finalModel) 
+head(boostImportPP)
+ggplot(data = boostImportPP[1:20,]) + 
+  geom_col(aes(x = Gain, 
+               y = reorder(Feature, Gain))) + 
+  labs(x = "Importance", y = "Feature")
+
+rm(tuneGrid, residuals)
+```
+
+### Model 7: Boosting on preprocessed, correlation-filtered data
+```{r boost-preprocessed-correlation-filtered, cache = TRUE, warning = FALSE}
+set.seed(1)
+
+trControl = trainControl(method = "repeatedcv", number = 10, repeats = 4)
+
+tuneGrid = data.frame('nrounds'=c(50, 150, 500, 1000, 2000, 3000),
+                      'max_depth' = c(2, 4),
+                      'eta' = .01,
+                      'gamma' = 0,
+                      'colsample_bytree' = 1,
+                      'min_child_weight' = 0,
+                      'subsample' = .5)
+
+boostOutPPremCorr = train(x = XppRemCorrTrain, y = Ytrain,
+                          method = "xgbTree", verbose = 0,
+                          tuneGrid = tuneGrid,
+                          trControl = trControl)
+
+plot(boostOutPPremCorr)
+boostOutPPremCorr$bestTune
+
+YhatTrainBoostPPremCorr = predict(boostOutPPremCorr, XppRemCorrTrain)
+YhatTestBoostPPremCorr = predict(boostOutPPremCorr, XppRemCorrTest)
+
+residuals = Ytrain - YhatTrainBoostPPremCorr
+plot(YhatTrainBoostPPremCorr, residuals,
+     xlab = 'Training Predictions', ylab = 'Residuals')
+
+(trErrBoostPPremCorr = mean((YhatTrainBoostPPremCorr - Ytrain)**2))
+(testErrBoostPPremCorr = mean((YhatTestBoostPPremCorr - Ytest)**2))
+
+boostImportPPremCorr = xgb.importance(model = boostOutPPremCorr$finalModel) 
+head(boostImportPPremCorr)
+ggplot(data = boostImportPPremCorr[1:20,]) + 
+  geom_col(aes(x = Gain, 
+               y = reorder(Feature, Gain))) + 
+  labs(x = "Importance", y = "Feature")
+
+rm(tuneGrid, residuals)
+```
+
+### Model 8: Refitted lasso on preprocessed, unfiltered data
+```{r refitted-lasso-preprocessed, cache = TRUE}
+
+set.seed(1)
+
+lassoOut = cv.glmnet(data.matrix(XppTrain), Ytrain,
+                     alpha = 1, nfolds = 10, repeats = 10)
+plot(lassoOut)
+
+betaHatTemp = coef(lassoOut, s = 'lambda.1se',)[-1]
+Srefitted = which(abs(betaHatTemp) > 1e-16)
+
+XtrainDFlasso = XppTrain[,Srefitted]
+refitOutPP = lm(Ytrain ~ ., data = XtrainDFlasso)
+betaHatRefitPP = coef(refitOutPP)
+YhatTrainRefitPP = predict(refitOutPP, XtrainDFlasso)
+
+XtestDFlasso = XppTest[,Srefitted]
+YhatTestRefitPP = predict(refitOutPP, XtestDFlasso)
+
+residuals = Ytrain - YhatTrainRefitPP
+plot(YhatTrainRefitPP, residuals,
+     xlab = 'Training Predictions', ylab = 'Residuals')
+
+(trErrRefitPP = mean((YhatTrainRefitPP - Ytrain)**2))
+(testErrRefitPP = mean((YhatTestRefitPP - Ytest)**2))
+
+refitImportPP = abs(betaHatRefitPP[-1])/sum(abs(betaHatRefitPP[-1]))
+refitImportPP = data.frame(sort(refitImportPP, decreasing = TRUE))
+names(refitImportPP) = "Importance"
+head(refitImportPP)
+ggplot(data = refitImportPP) + 
+  geom_col(aes(x = Importance, 
+               y = reorder(row.names(refitImportPP), Importance))) + 
+  labs(x = "Importance", y = "Feature")
+
+rm(lassoOut, betaHatTemp, Srefitted, residuals)
+```
+
+### Model 9: Refitted lasso on preprocessed, hand-selected data
+```{r refitted-lasso-preprocessed-selected, cache = TRUE}
+
+set.seed(1)
+
+lassoOut = cv.glmnet(data.matrix(XppSelectTrain), Ytrain,
+                     alpha = 1, nfolds = 10, repeats = 10)
+plot(lassoOut)
+minLambda = min(lassoOut$lambda)
+lambdaNew = seq(minLambda, minLambda*0.001,length=1000)
+lassoOut  = cv.glmnet(data.matrix(XppSelectTrain), Ytrain,
+                      alpha = 1, nfolds = 10, repeats = 10, lambda = lambdaNew)
+betaHatTemp = coef(lassoOut, s = 'lambda.1se',)[-1]
+Srefitted = which(abs(betaHatTemp) > 1e-16)
+
+XtrainDFlasso = XppSelectTrain[,Srefitted]
+refitOutPPselect = lm(Ytrain ~ ., data = XtrainDFlasso)
+betaHatRefitPPselect = coef(refitOutPPselect)
+YhatTrainRefitPPselect = predict(refitOutPPselect, XtrainDFlasso)
+
+XtestDFlasso = XppSelectTest[,Srefitted]
+YhatTestRefitPPselect = predict(refitOutPPselect, XtestDFlasso)
+
+residuals = Ytrain - YhatTrainRefitPPselect
+plot(YhatTrainRefitPPselect, residuals,
+     xlab = 'Training Predictions', ylab = 'Residuals')
+
+(trErrRefitPPselect = mean((YhatTrainRefitPPselect - Ytrain)**2))
+(testErrRefitPPselect = mean((YhatTestRefitPPselect - Ytest)**2))
+
+refitImportPPselect = 
+  abs(betaHatRefitPPselect[-1])/sum(abs(betaHatRefitPPselect[-1]))
+refitImportPPselect = data.frame(sort(refitImportPPselect, decreasing = TRUE))
+names(refitImportPPselect) = "Importance"
+head(refitImportPPselect)
+ggplot(data = refitImportPPselect) + 
+  geom_col(aes(x = Importance, 
+               y = reorder(row.names(refitImportPPselect), Importance))) + 
+  labs(x = "Importance", y = "Feature")
+
+rm(lassoOut, betaHatTemp, minLambda, lambdaNew, Srefitted, residuals)
+```
+
+### Model 10: Refitted lasso on preprocessed, correlation-filtered data
+```{r refitted-lasso-preprocessed-correlation-filtered, cache = TRUE}
+
+set.seed(1)
+
+lassoOut = cv.glmnet(data.matrix(XppRemCorrTrain), Ytrain,
+                     alpha = 1, nfolds = 10, repeats = 10)
+plot(lassoOut)
+
+betaHatTemp = coef(lassoOut, s = 'lambda.1se',)[-1]
+Srefitted = which(abs(betaHatTemp) > 1e-16)
+
+XtrainDFlasso = XppRemCorrTrain[,Srefitted]
+refitOutPPremCorr = lm(Ytrain ~ ., data = XtrainDFlasso)
+betaHatRefitPPremCorr = coef(refitOutPPremCorr)
+YhatTrainRefitPPremCorr = predict(refitOutPPremCorr, XtrainDFlasso)
+
+XtestDFlasso = XppRemCorrTest[,Srefitted]
+YhatTestRefitPPremCorr = predict(refitOutPPremCorr, XtestDFlasso)
+
+residuals = Ytrain - YhatTrainRefitPPremCorr
+plot(YhatTrainRefitPPremCorr, residuals,
+     xlab = 'Training Predictions', ylab = 'Residuals')
+
+(trErrRefitPPremCorr = mean((YhatTrainRefitPPremCorr - Ytrain)**2))
+(testErrRefitPPremCorr = mean((YhatTestRefitPPremCorr - Ytest)**2))
+
+refitImportPPremCorr = 
+  abs(betaHatRefitPPremCorr[-1])/sum(abs(betaHatRefitPPremCorr[-1]))
+refitImportPPremCorr = data.frame(sort(refitImportPPremCorr, decreasing = TRUE))
+names(refitImportPPremCorr) = "Importance"
+head(refitImportPPremCorr)
+ggplot(data = refitImportPPremCorr) + 
+  geom_col(aes(x = Importance, 
+               y = reorder(row.names(refitImportPPremCorr), Importance))) + 
+  labs(x = "Importance", y = "Feature")
+
+rm(lassoOut, betaHatTemp, Srefitted, residuals)
+```
